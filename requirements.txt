@@ -1,0 +1,4 @@
+PyQt5>=5.15
+WMI>=1.5
+psutil>=5.9
+pythonnet>=3.0
