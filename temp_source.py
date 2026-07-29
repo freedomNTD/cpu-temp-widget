@@ -75,6 +75,15 @@ def _get_computer():
         c.IsPsuEnabled = False
         c.Open()
         _computer = c
+        # 预热：LHM 部分传感器首次 Update 后值仍为 None，需要几次刷新才稳定
+        try:
+            import time as _time
+            for _ in range(2):
+                for hw in c.Hardware:
+                    hw.Update()
+                _time.sleep(0.3)
+        except Exception:
+            pass
         log.info("已加载嵌入式 LibreHardwareMonitor 库")
         return c
     except Exception as e:
@@ -89,20 +98,27 @@ def _stype(s) -> str:
 def _read_embedded() -> Stats:
     """从嵌入的 LHM 库一次性读取所有指标。
 
-    对 CPU 采用「优先级回退」策略，兼容不同代际 CPU 的传感器命名差异：
-      温度: CPU Package -> Core Average -> Core Max -> 任一核心温度
-      功率: CPU Package -> CPU Cores -> CPU Package Power -> 任一 CPU 功率
-      占用: CPU Total -> CPU Core Max -> 任一核心占用
+    采用「按硬件类型分组 + 启发式选值」的通用策略，不依赖具体型号命名，
+    自动兼容 Intel/AMD、独显/核显/APU、桌面/笔记本等不同配置：
+      CPU 温度: 收集所有核心/封装温度（排除 distance to tjmax）取最大值
+                （≈ CPU Package；AMD Tctl 本身即最高核心，逻辑一致）
+      CPU 功率: 取所有 CPU 功率读数中的最大值
+      CPU 占用: 优先 "total"，否则所有核心占用的平均
+      GPU: 支持多块 GPU，取温度最高的那块；每项优先 "core/package"，否则取该 GPU 最高读数
+      内存: 认 Memory 类型硬件，排除虚拟内存组
     """
     st = Stats()
     c = _get_computer()
     if c is None:
         return st
 
-    # CPU 各类候选值，按优先级排序
-    cpu_temp_candidates = []
-    cpu_load_candidates = []
-    cpu_power_candidates = []
+    # 各硬件类型分组的传感器值
+    cpu_temps = []          # CPU 温度候选
+    cpu_loads = []          # CPU 各核心占用
+    cpu_total_load = None   # CPU Total 占用
+    cpu_powers = []         # CPU 功率候选
+
+    gpu_list = []           # 每块 GPU: dict(temp_cands=[], load=None, power_cands=[])
 
     try:
         for hw in c.Hardware:
@@ -120,6 +136,12 @@ def _read_embedded() -> Stats:
                 for sub in hw.SubHardware:
                     sensors.extend(sub.Sensors)
 
+            # GPU 分组容器
+            ginfo = None
+            if is_gpu:
+                ginfo = {"temp_cands": [], "load": None, "power_cands": []}
+                gpu_list.append(ginfo)
+
             for s in sensors:
                 t = _stype(s)
                 val = s.Value
@@ -127,53 +149,63 @@ def _read_embedded() -> Stats:
                     continue
                 name = str(s.Name or "")
                 lname = name.lower()
+                fval = float(val)
 
                 if is_cpu:
                     if t == "Temperature":
-                        if "package" in lname:
-                            cpu_temp_candidates.insert(0, float(val))  # 最高优先
-                        elif "core average" in lname:
-                            cpu_temp_candidates.append(float(val))
-                        elif "core max" in lname:
-                            cpu_temp_candidates.append(float(val))
-                        elif "core" in lname or "distance" not in lname:
-                            # 任一核心温度（排除 distance to tjmax）
-                            cpu_temp_candidates.append(float(val))
+                        # 排除 "Distance to TjMax"（不是真实温度）
+                        if "distance" in lname:
+                            continue
+                        cpu_temps.append(fval)
                     elif t == "Load":
                         if "total" in lname:
-                            cpu_load_candidates.insert(0, float(val))
-                        elif "core max" in lname:
-                            cpu_load_candidates.append(float(val))
-                        elif "core" in lname:
-                            cpu_load_candidates.append(float(val))
+                            cpu_total_load = fval
+                        else:
+                            cpu_loads.append(fval)
                     elif t == "Power":
-                        if "package" in lname:
-                            cpu_power_candidates.insert(0, float(val))
-                        elif "cores" in lname:
-                            cpu_power_candidates.append(float(val))
-                        elif "cpu" in lname:
-                            cpu_power_candidates.append(float(val))
-                elif is_gpu:
+                        cpu_powers.append(fval)
+                elif is_gpu and ginfo is not None:
                     if t == "Temperature":
+                        ginfo["temp_cands"].append(fval)
+                    elif t == "Load" and ginfo["load"] is None:
+                        # 优先 "GPU Core" 占用
                         if "core" in lname:
-                            st.gpu_temp = float(val)
-                        elif st.gpu_temp is None and "hot spot" in lname:
-                            st.gpu_temp = float(val)
-                    elif t == "Load" and lname == "gpu core":
-                        st.gpu_load = float(val)
-                    elif t == "Power" and "package" in lname:
-                        st.gpu_power = float(val)
+                            ginfo["load"] = fval
+                        elif ginfo["load"] is None:
+                            ginfo["load"] = fval
+                    elif t == "Power":
+                        ginfo["power_cands"].append(fval)
                 elif is_mem:
-                    if t == "Load" and lname == "memory":
-                        st.mem_load = float(val)
+                    if t == "Load" and "memory" in lname:
+                        st.mem_load = fval
 
-        # 取 CPU 各项的优先级最高者
-        if cpu_temp_candidates:
-            st.cpu_temp = round(cpu_temp_candidates[0], 1)
-        if cpu_load_candidates:
-            st.cpu_load = round(cpu_load_candidates[0], 1)
-        if cpu_power_candidates:
-            st.cpu_power = round(cpu_power_candidates[0], 1)
+        # ---- CPU 汇总 ----
+        if cpu_temps:
+            st.cpu_temp = round(max(cpu_temps), 1)
+        if cpu_total_load is not None:
+            st.cpu_load = round(cpu_total_load, 1)
+        elif cpu_loads:
+            st.cpu_load = round(sum(cpu_loads) / len(cpu_loads), 1)
+        if cpu_powers:
+            st.cpu_power = round(max(cpu_powers), 1)
+
+        # ---- GPU 汇总（多 GPU 取温度最高者显示）----
+        best_gpu_temp = None
+        best_gpu_load = None
+        best_gpu_power = None
+        for g in gpu_list:
+            # 该 GPU 温度：优先最高（hot spot 或 core 都涵盖）
+            g_temp = max(g["temp_cands"]) if g["temp_cands"] else None
+            if g_temp is not None and (best_gpu_temp is None or g_temp > best_gpu_temp):
+                best_gpu_temp = g_temp
+                best_gpu_load = g["load"]
+                best_gpu_power = max(g["power_cands"]) if g["power_cands"] else None
+        if best_gpu_temp is not None:
+            st.gpu_temp = round(best_gpu_temp, 1)
+        if best_gpu_load is not None:
+            st.gpu_load = round(best_gpu_load, 1)
+        if best_gpu_power is not None:
+            st.gpu_power = round(best_gpu_power, 1)
 
     except Exception as e:
         log.warning("嵌入式 LHM 读取异常: %s", e)
