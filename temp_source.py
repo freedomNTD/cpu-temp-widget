@@ -87,16 +87,26 @@ def _stype(s) -> str:
 
 
 def _read_embedded() -> Stats:
-    """从嵌入的 LHM 库一次性读取所有指标。"""
+    """从嵌入的 LHM 库一次性读取所有指标。
+
+    对 CPU 采用「优先级回退」策略，兼容不同代际 CPU 的传感器命名差异：
+      温度: CPU Package -> Core Average -> Core Max -> 任一核心温度
+      功率: CPU Package -> CPU Cores -> CPU Package Power -> 任一 CPU 功率
+      占用: CPU Total -> CPU Core Max -> 任一核心占用
+    """
     st = Stats()
     c = _get_computer()
     if c is None:
         return st
 
+    # CPU 各类候选值，按优先级排序
+    cpu_temp_candidates = []
+    cpu_load_candidates = []
+    cpu_power_candidates = []
+
     try:
         for hw in c.Hardware:
             hw.Update()
-            # GPU 子硬件（部分显卡信息在 SubHardware）
             for sub in hw.SubHardware:
                 sub.Update()
             htype = str(hw.HardwareType)
@@ -106,7 +116,6 @@ def _read_embedded() -> Stats:
             is_mem = "Memory" in htype and "Virtual" not in htype and "Total" not in htype
 
             sensors = list(hw.Sensors)
-            # GPU 优先看 SubHardware
             if is_gpu:
                 for sub in hw.SubHardware:
                     sensors.extend(sub.Sensors)
@@ -117,29 +126,55 @@ def _read_embedded() -> Stats:
                 if val is None:
                     continue
                 name = str(s.Name or "")
+                lname = name.lower()
 
-                if t == "Temperature":
-                    if is_cpu:
-                        if "package" in name.lower():
-                            st.cpu_temp = float(val)
-                    elif is_gpu:
-                        # GPU Core 温度（优先），否则用 hot spot
-                        if "core" in name.lower():
+                if is_cpu:
+                    if t == "Temperature":
+                        if "package" in lname:
+                            cpu_temp_candidates.insert(0, float(val))  # 最高优先
+                        elif "core average" in lname:
+                            cpu_temp_candidates.append(float(val))
+                        elif "core max" in lname:
+                            cpu_temp_candidates.append(float(val))
+                        elif "core" in lname or "distance" not in lname:
+                            # 任一核心温度（排除 distance to tjmax）
+                            cpu_temp_candidates.append(float(val))
+                    elif t == "Load":
+                        if "total" in lname:
+                            cpu_load_candidates.insert(0, float(val))
+                        elif "core max" in lname:
+                            cpu_load_candidates.append(float(val))
+                        elif "core" in lname:
+                            cpu_load_candidates.append(float(val))
+                    elif t == "Power":
+                        if "package" in lname:
+                            cpu_power_candidates.insert(0, float(val))
+                        elif "cores" in lname:
+                            cpu_power_candidates.append(float(val))
+                        elif "cpu" in lname:
+                            cpu_power_candidates.append(float(val))
+                elif is_gpu:
+                    if t == "Temperature":
+                        if "core" in lname:
                             st.gpu_temp = float(val)
-                        elif st.gpu_temp is None and "hot spot" in name.lower():
+                        elif st.gpu_temp is None and "hot spot" in lname:
                             st.gpu_temp = float(val)
-                elif t == "Load":
-                    if is_cpu and "total" in name.lower():
-                        st.cpu_load = float(val)
-                    elif is_gpu and name.lower() == "gpu core":
+                    elif t == "Load" and lname == "gpu core":
                         st.gpu_load = float(val)
-                    elif is_mem and name.lower() == "memory":
-                        st.mem_load = float(val)
-                elif t == "Power":
-                    if is_cpu and "package" in name.lower():
-                        st.cpu_power = float(val)
-                    elif is_gpu and "package" in name.lower():
+                    elif t == "Power" and "package" in lname:
                         st.gpu_power = float(val)
+                elif is_mem:
+                    if t == "Load" and lname == "memory":
+                        st.mem_load = float(val)
+
+        # 取 CPU 各项的优先级最高者
+        if cpu_temp_candidates:
+            st.cpu_temp = round(cpu_temp_candidates[0], 1)
+        if cpu_load_candidates:
+            st.cpu_load = round(cpu_load_candidates[0], 1)
+        if cpu_power_candidates:
+            st.cpu_power = round(cpu_power_candidates[0], 1)
+
     except Exception as e:
         log.warning("嵌入式 LHM 读取异常: %s", e)
     return st
